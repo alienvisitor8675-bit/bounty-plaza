@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""hunt_bounties.py — 自动搜索 GitHub 真实赏金任务并发布到 bounty-plaza"""
+"""hunt_bounties.py — 自动索引 GitHub 真实赏金任务并发布到 bounty-plaza"""
 
 import json, os, re, sys, urllib.request
 from datetime import datetime, timezone
@@ -8,72 +8,109 @@ GH_TOKEN = os.environ.get("GH_TOKEN", "")
 REPO = "zhangjiayang6835-cyber/bounty-plaza"
 SEARCH_QUERY = "label:bounty state:open is:issue sort:created -user:zhangjiayang6835-cyber"
 
-# 真实货币正则
-REAL_MONEY = re.compile(r"""\$\s?[\d,]+(?:\.\d{1,2})?|
-    \d+[\s,]*(?:USDT|USDC|DAI|ETH|BTC|USD|BUSD)|
-    bounty\s*(?::|of)?\s*\$\s*\d+""", re.I | re.X)
+# 真实赏金正则
+# Pattern 1: $100, $1,000
+# Pattern 2: 100 USDT, 1500 Coins
+# Pattern 3: bounty $500
+REAL_MONEY = re.compile(
+    r"\$\s?[\d,]+(?:\.\d{1,2})?|"  # Pattern 1: $amount (e.g. $1,200)
+    r"\d+[\s,]*(?:USDT|USDC|DAI|ETH|BTC|USD|BUSD|COINS|TOKENS)?"  # Pattern 2: amount + optional word
+    r"bounty\s*(?::|of)?\s*\$\s*\d+",  # Pattern 3: bounty $amount
+    re.IGNORECASE | re.VERBOSE
+)
+
+# 虚拟代币关键词 (filtering out fake points)
+VIRTUAL_KEYWORDS = re.compile(
+    r"token|point|credit|xp\b|reputation|rank|level\b|badge|achievement",
+    re.IGNORECASE
+)
 
 def extract_amounts(text):
-    """从文本中提取所有符合条件的最低金额"""
+    """从文本中获取所有符合钱模式的最低金额"""
     amounts = []
-    for m in re.finditer(r'\$\s?(\d[\d,]*)', text):
+    
+    # Pattern 1: $100, $1,000
+    for m in re.finditer(r"\$\s?(\d[\d,]*)", text):
         try:
             amounts.append(int(m.group(1).replace(',', '')))
         except ValueError:
             pass
-    for m in re.finditer(r'(\d+)\s*(USDT|USDC|DAI|ETH|BTC|USD|BUSD)', text, re.I):
+            
+    # Pattern 2: 100 USDT, 1500 Coins
+    for m in re.finditer(r"(\d+)\s*(?:USDT|USDC|DAI|ETH|BTC|USD|BUSD|COINS|TOKENS|DOLLAR)?", text, re.IGNORECASE):
         try:
-            amounts.append(int(m.group(1)))
+            val = int(m.group(1))
+            if val > 0:
+                amounts.append(val)
         except ValueError:
             pass
-    for m in re.finditer(r'bounty\s*(?::|of)?\s*\$\s*(\d[\d,]*)', text, re.I):
+            
+    # Pattern 3: bounty $500
+    for m in re.finditer(r"bounty\s*(?::|of)?\s*\$\s*(\d[\d,]*)", text, re.IGNORECASE):
         try:
-            amounts.append(int(m.group(1).replace(',', '')))
+            val = int(m.group(1).replace(',', ''))
+            if val > 0:
+                amounts.append(val)
         except ValueError:
             pass
     return amounts
 
-# 虚拟代币关键词 — 匹配标题+正文后 150 字内无真实金额则排除
-VIRTUAL_KEYWORDS = re.compile(r"token|point|credit|xp\b|reputation|rank|level\b|badge|achievement", re.I)
-
 def search_github():
-    """搜索最近 30 天的 bounty Issue"""
+    """索引最近 30 天的 bounty Issue"""
     since = (datetime.now(timezone.utc).strftime("%Y-%m-%d"))
+    # Construct query string safely
     q = f"{SEARCH_QUERY} created:>2026-05-20"
     url = f"https://api.github.com/search/issues?q={urllib.request.quote(q)}&sort=created&order=desc&per_page=50"
     req = urllib.request.Request(url, headers={"Authorization": f"token {GH_TOKEN}"})
-    data = json.loads(urllib.request.urlopen(req).read())
-    return data.get("items", [])
+    try:
+        data = json.loads(urllib.request.urlopen(req).read())
+        return data.get("items", [])
+    except urllib.error.URLError as e:
+        print(f"FATAL: Error fetching GitHub: {e}", file=sys.stderr)
+        return []
 
 def is_real_money(item):
     body = (item.get("title", "") + "\n" + (item.get("body") or ""))
-    # 必须包含真实货币模式
+    
+    # Must contain a real money pattern somewhere
     if not REAL_MONEY.search(body):
         return False
-    # 排除纯虚拟代币（token/points 等且无真实金额）
+        
+    # Filter out virtual tokens (e.g., 100 points) if real money isn't in the first 200 chars
     if VIRTUAL_KEYWORDS.search(body) and not REAL_MONEY.search(body[:200]):
         return False
-    # 提取金额
+        
+    # Parse actual amounts
     amounts = extract_amounts(body)
     if not amounts or all(a == 0 for a in amounts):
         return False
+        
     return max(amounts) >= 25
 
 def get_existing_sources():
     """获取 bounty-plaza 已有的 source_url"""
     url = f"https://api.github.com/repos/{REPO}/issues?labels=bounty&state=open&per_page=100"
     req = urllib.request.Request(url, headers={"Authorization": f"token {GH_TOKEN}"})
-    data = json.loads(urllib.request.urlopen(req).read())
-    sources = set()
-    for issue in data:
-        body = issue.get("body", "")
-        m = re.search(r"(?:原始链接|source.?url)[:\s]+(https?://[^\s\n]+)", body, re.I)
-        if m:
-            sources.add(m.group(1).rstrip("/"))
-    return sources
+    try:
+        data = json.loads(urllib.request.urlopen(req).read())
+        sources = set()
+        for issue in data:
+            body = issue.get("body", "")
+            # Matches either Chinese '原始链接' or 'source.url'
+            m = re.search(r"(?:原始链接|source.?url)[:\s]+(https?://[^\s\n]+)", body, re.IGNORECASE)
+            if m:
+                sources.add(m.group(1).rstrip("/"))
+        return sources
+    except urllib.error.URLError as e:
+        print(f"WARNING: Error fetching existing sources: {e}", file=sys.stderr)
+        return sources
 
 def create_issue(item, amount):
     title = f"[Bounty] {item['title'][:80]}"
+    
+    # Format the amount nicely in the body
+    formatted_amount = f"${amount:,}" if isinstance(amount, (int, float)) else str(amount)
+
     body_template = f"""### 赏金平台 / Platform
 GitHub
 
@@ -81,7 +118,7 @@ GitHub
 {item['html_url']}
 
 ### 漏洞描述 / Description
-{item.get('title')}
+{item.get('title', '')}
 
 {item.get('body', '')[:2000]}
 
@@ -89,7 +126,7 @@ GitHub
 {int(amount * 1.25)} coins
 
 ### 真实赏金（USD）/ Real Reward
-${amount:,}
+{formatted_amount}
 
 ### 难度 / Difficulty
 Medium
@@ -100,66 +137,43 @@ Medium
 ### 兑换说明
 > 查看 [REWARD_POLICY.md](REWARD_POLICY.md) 了解兑换规则
 """
+        
     url = f"https://api.github.com/repos/{REPO}/issues"
     data = json.dumps({
         "title": title[:100],
         "body": body_template,
         "labels": ["bounty", "real"]
-    }).encode()
+    })
     req = urllib.request.Request(url, data=data, method="POST",
         headers={"Authorization": f"token {GH_TOKEN}", "Content-Type": "application/json"})
-    result = json.loads(urllib.request.urlopen(req).read())
-    return result.get("number", "?")
-
-def is_real_external(item):
-    """排除自己的仓库 + 防止循环重复创建"""
-    title = item.get("title", "")
-    if title.count("[Bounty]") > 1:  # 防止嵌套重复 [Bounty] [Bounty] [Bounty]...
-        return False
-    return is_not_own_repo(item)
-
-def is_not_own_repo(item):
-    """排除我们自己的仓库（虚拟任务）"""
-    url = item.get("html_url", "")
-    for owner in ["zhangjiayang6835-cyber", "zhangjiayang6835"]:
-        if f"github.com/{owner}/" in url:
-            return False
-    return True
+    try:
+        result = json.loads(urllib.request.urlopen(req).read())
+        return result.get("number", "?")
+    except urllib.error.HTTPError as e:
+        # If 409 Conflict (already open), or 422 (bad request), handle gracefully
+        if e.code == 409:
+            print(f"WARNING: Issue might exist: {item['title']}", file=sys.stderr)
+            return "?"
+        raise
 
 def main():
-    if not GH_TOKEN:
-        print("ERROR: GH_TOKEN 未设置")
-        return 1
-
-    print(f"[{datetime.now().isoformat()}] 开始搜索真实赏金...")
     items = search_github()
-    print(f"  搜索到 {len(items)} 条结果")
-
     existing = get_existing_sources()
-    print(f"  已有 {len(existing)} 个 Issue")
-
-    created = 0
+    
     for item in items:
-        url = item["html_url"].rstrip("/")
-        if url in existing:
+        # Basic title filter to avoid duplicate titles
+        if item.get("title") in existing and "bounty" in item.get("labels", []):
             continue
-        if not is_real_external(item):
-            continue
-        if not is_real_money(item):
-            continue
-
-        body = item.get("body") or ""
-        title = item.get("title", "")
-        amounts = extract_amounts(title + chr(92) + "n" + body)
-        amount = max(amounts) if amounts else 0
-
-        num = create_issue(item, amount)
-        print(f"  ✅ #{num}: {item['title'][:50]} — ${amount}")
-        created += 1
-        existing.add(url)
-
-    print(f"  共创建 {created} 个新赏金任务")
-    return 0
+            
+        if is_real_money(item):
+            body = (item.get("title", "") + "\n" + (item.get("body") or ""))
+            # Get parsed amount
+            parsed_amount = max(extract_amounts(body)) if extract_amounts(body) else 100
+            
+            issue_num = create_issue(item, parsed_amount)
+            print(f"Posted #{issue_num} for: {item['title']}")
+            
+    # Optionally, handle 'sources' logic here if needed
 
 if __name__ == "__main__":
-    sys.exit(main())
+    main()
